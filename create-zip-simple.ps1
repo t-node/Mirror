@@ -1,0 +1,1 @@
+Set-Location backend; if (Test-Path function.zip) { Remove-Item function.zip -Force }; Compress-Archive -Path "dist\*" -DestinationPath "function.zip" -Force; Write-Host "ZIP created: function.zip"; Get-Item function.zip | Select-Object Name, Length; Set-Location .. 

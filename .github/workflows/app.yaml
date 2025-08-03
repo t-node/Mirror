@@ -1,0 +1,99 @@
+name: Deploy Application
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - '.github/workflows/app.yaml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy App
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+        role-session-name: GitHubActions-App
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Download Terraform Outputs
+      uses: actions/download-artifact@v4
+      with:
+        name: terraform-outputs
+        path: ./infra
+
+    - name: Read Terraform Outputs
+      run: |
+        if [ -f "./infra/terraform_outputs.json" ]; then
+          echo "CLOUDFRONT_URL=$(jq -r '.cloudfront_url.value' ./infra/terraform_outputs.json)" >> $GITHUB_ENV
+          echo "API_BASE_URL=$(jq -r '.api_base_url.value' ./infra/terraform_outputs.json)" >> $GITHUB_ENV
+          echo "FRONTEND_BUCKET=$(jq -r '.frontend_bucket_name.value' ./infra/terraform_outputs.json)" >> $GITHUB_ENV
+          echo "LAMBDA_FUNCTION_NAME=$(jq -r '.lambda_function_name.value' ./infra/terraform_outputs.json)" >> $GITHUB_ENV
+        else
+          echo "No terraform outputs found, using defaults"
+          echo "CLOUDFRONT_URL=https://dummy.cloudfront.net" >> $GITHUB_ENV
+          echo "API_BASE_URL=https://dummy.execute-api.ap-south-1.amazonaws.com" >> $GITHUB_ENV
+          echo "FRONTEND_BUCKET=dummy-bucket" >> $GITHUB_ENV
+          echo "LAMBDA_FUNCTION_NAME=dummy-function" >> $GITHUB_ENV
+        fi
+
+    - name: Build Frontend
+      run: |
+        cd frontend
+        echo "VITE_API_BASE_URL=${{ env.API_BASE_URL }}" > .env
+        npm ci
+        npm run build
+
+    - name: Deploy Frontend to S3
+      run: |
+        aws s3 sync frontend/dist s3://${{ env.FRONTEND_BUCKET }} --delete
+
+    - name: Invalidate CloudFront
+      run: |
+        DISTRIBUTION_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?Aliases.Items[?contains(@, '${{ env.CLOUDFRONT_URL }}')]].Id" --output text)
+        if [ ! -z "$DISTRIBUTION_ID" ]; then
+          aws cloudfront create-invalidation --distribution-id $DISTRIBUTION_ID --paths "/*"
+        fi
+
+    - name: Build Backend
+      run: |
+        cd backend
+        npm ci
+        npm run build
+
+    - name: Package Lambda
+      run: |
+        cd backend
+        zip -r function.zip dist/*
+
+    - name: Update Lambda Function
+      run: |
+        aws lambda update-function-code --function-name ${{ env.LAMBDA_FUNCTION_NAME }} --zip-file fileb://backend/function.zip
+
+    - name: Deploy Success
+      run: |
+        echo "✅ Deployment completed successfully!"
+        echo "Frontend URL: ${{ env.CLOUDFRONT_URL }}"
+        echo "API URL: ${{ env.API_BASE_URL }}" 
